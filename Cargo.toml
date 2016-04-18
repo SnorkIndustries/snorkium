@@ -4,3 +4,5 @@ version = "0.1.0"
 authors = ["Robert Habermeier <rphmeier@gmail.com>"]
 
 [dependencies]
+glutin = "0.5"
+gl = "0.6"
