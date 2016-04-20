@@ -18,6 +18,9 @@ pub trait Storage<T: Component> {
     /// Set the component data for an entity.
     fn set(&mut self, e: VerifiedEntity, data: T);
     
+    /// Whether this entity has this component.
+    fn has(&self, e: VerifiedEntity) -> bool;
+    
     /// Get a reference to the component data for an entity.
     fn get(&self, e: VerifiedEntity) -> Option<&T>;
     
@@ -72,6 +75,14 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
         } else {
             self.data.push(data);
             self.indices[id] = Some(self.data.len() - 1);
+        }
+    }
+    
+    fn has(&self, e: VerifiedEntity) -> bool {
+        if let Some(&Some(_)) = self.indices.get(e.entity().id() as usize) {
+            true
+        } else {
+            false
         }
     }
     
