@@ -9,8 +9,35 @@ const MIN_UNUSED: usize = 1024;
 pub trait Component: Copy + 'static {}
 impl<T: Copy + 'static> Component for T {}
 
+/// Component data storage.
+///
+/// In general, this will be used through `DefaultStorage`, but some components
+/// can be more conveniently used through special data structures.
+/// In the future, it will be possible to define custom filters.
+pub trait Storage<T: Component> {
+    /// Set the component data for an entity.
+    fn set(&mut self, e: VerifiedEntity, data: T);
+    
+    /// Get a reference to the component data for an entity.
+    fn get(&self, e: VerifiedEntity) -> Option<&T>;
+    
+    /// Get a mutable reference to the component data for an entity.
+    fn get_mut(&mut self, e: VerifiedEntity) -> Option<&mut T>;
+    
+    /// Remove an entity's data, returning it by value if it existed.
+    fn remove(&mut self, e: VerifiedEntity) -> Option<T>;
+    
+    /// Destroy an entity's data without returning the data.
+    ///
+    /// This entity may not be alive.
+    /// This will usually be called with entities that have been
+    /// destroyed in a previous frame to have storage mappers clean
+    /// up.
+    fn destroy(&mut self, e: Entity);
+}
+
 // Component data storage.
-struct DefaultStorage<T: Component> {
+pub struct DefaultStorage<T: Component> {
     // data vector -- this is tightly packed.
     data: Vec<T>,
     // loosely packed lookup table mapping entity ids to data indices.
@@ -27,7 +54,9 @@ impl<T: Component> DefaultStorage<T> {
             unused: VecDeque::new(),
         }
     }
-    
+}
+
+impl<T: Component> Storage<T> for DefaultStorage<T> {    
     /// Sets the component for the given entity.
     fn set(&mut self, e: VerifiedEntity, data: T) {
         let id = e.entity().id() as usize;
@@ -79,12 +108,6 @@ impl<T: Component> DefaultStorage<T> {
         }
     }
     
-    /// Destroy an entity's data without returning the data.
-    ///
-    /// This entity may not be alive.
-    /// This will usually be called with entities that have been
-    /// destroyed in a previous frame to have storage mappers clean
-    /// up.
     fn destroy(&mut self, e: Entity) {
         if let Some(&Some(idx)) = self.indices.get(e.id() as usize) {
             self.indices[e.id() as usize] = None;
