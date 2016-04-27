@@ -1,13 +1,32 @@
-//! A multithreaded Entity Component Systems (ECS)
+//! A multithreaded Entity Component System (ECS)
 
+use std::any::{Any, TypeId};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::mem;
 
 const ID_BITS: usize = 24;
 const MIN_UNUSED: usize = 1024;
 
-pub trait Component: Copy + 'static {}
-impl<T: Copy + 'static> Component for T {}
+/// A component is a piece of raw data which is associated with an entity.
+///
+/// "Systems" will typically iterate over all entities with a specific set of components,
+/// performing some action for each.
+pub trait Component: Any + Copy {
+    /// The data structure which stores component of this type.
+    ///
+    /// By default, this will be the `DefaultStorage` structure,
+    /// which is good for almost all use-cases.
+    /// However, for some components, it is more performant to store them
+    /// in a special data structure with custom filters. A good example of this
+    /// is positional data, which can be queried much more easily when stored
+    /// in a quadtree or octree.
+    type Storage: Storage<Self>;
+}
+
+impl<T: Any + Copy> Component for T {
+    default type Storage = DefaultStorage<Self>;
+}
 
 /// Component data storage.
 ///
@@ -36,7 +55,25 @@ pub trait Storage<T: Component> {
     /// This will usually be called with entities that have been
     /// destroyed in a previous frame to have storage mappers clean
     /// up.
-    fn destroy(&mut self, e: Entity);
+    fn destroy(&mut self, e: Entity);  
+    
+    /// Return an iterator over all entities this stores data for.
+    fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a>;
+}
+
+#[derive(Clone, Copy)]
+struct Index {
+    off: usize,
+    entity: Entity,
+}
+
+impl Index {
+    fn new(off: usize, entity: Entity) -> Self {
+        Index {
+            off: off,
+            entity: entity,
+        }
+    }
 }
 
 // Component data storage.
@@ -44,7 +81,7 @@ pub struct DefaultStorage<T: Component> {
     // data vector -- this is tightly packed.
     data: Vec<T>,
     // loosely packed lookup table mapping entity ids to data indices.
-    indices: Vec<Option<usize>>,
+    indices: Vec<Option<Index>>,
     // unused indices in the data table.
     unused: VecDeque<usize>,
 }
@@ -68,19 +105,20 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
         }
         
         if let Some(idx) = self.indices[id] {
-            self.data[idx] = data;
-        } else if let Some(idx) = self.unused.pop_front() {
-            self.data[idx] = data;
-            self.indices[id] = Some(idx);
+            self.data[idx.off] = data;
+            self.indices[id].unwrap().entity = e.entity();
+        } else if let Some(off) = self.unused.pop_front() {
+            self.data[off] = data;
+            self.indices[id] = Some(Index::new(off, e.entity()));
         } else {
             self.data.push(data);
-            self.indices[id] = Some(self.data.len() - 1);
+            self.indices[id] = Some(Index::new(self.data.len() - 1, e.entity()));
         }
     }
     
     fn has(&self, e: VerifiedEntity) -> bool {
-        if let Some(&Some(_)) = self.indices.get(e.entity().id() as usize) {
-            true
+        if let Some(&Some(idx)) = self.indices.get(e.entity().id() as usize) {
+            idx.entity == e.entity()
         } else {
             false
         }
@@ -89,8 +127,8 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
     /// Get a reference to an entity's data.
     fn get(&self, e: VerifiedEntity) -> Option<&T> {
         match self.indices.get(e.entity().id() as usize) {
-            Some(&Some(idx)) => {
-                Some(&self.data[idx])
+            Some(&Some(idx)) if idx.entity == e.entity() => {
+                Some(&self.data[idx.off])
             }
             _ => None,
         }
@@ -99,8 +137,8 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
     /// Get a mutable reference to an entity's data.
     fn get_mut(&mut self, e: VerifiedEntity) -> Option<&mut T> {
         match self.indices.get(e.entity().id() as usize) {
-            Some(&Some(idx))=> {
-                Some(&mut self.data[idx])
+            Some(&Some(idx)) if idx.entity == e.entity() => {
+                Some(&mut self.data[idx.off])
             }
             _ => None,
         }
@@ -111,9 +149,13 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
         match self.indices.get(e.entity().id() as usize) {
             Some(&Some(idx)) => {
                 self.indices[e.entity().id() as usize] = None;
-                self.unused.push_back(idx);
+                self.unused.push_back(idx.off);
                 
-                Some(self.data[idx])
+                if idx.entity == e.entity() {
+                    Some(self.data[idx.off])
+                } else {
+                    None
+                }
             }       
             _ => None,
         }
@@ -122,8 +164,22 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
     fn destroy(&mut self, e: Entity) {
         if let Some(&Some(idx)) = self.indices.get(e.id() as usize) {
             self.indices[e.id() as usize] = None;
-            self.unused.push_back(idx);
+            self.unused.push_back(idx.off);
         }
+    }
+    
+    fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a> {
+        let iter = self.indices.iter().filter_map(|idx| {
+            idx.as_ref().map(|inner| inner.entity)
+        });
+        
+        Box::new(iter)
+    }
+}
+
+impl<T: Component> Default for DefaultStorage<T> {
+    fn default() -> Self {
+        DefaultStorage::new()
     }
 }
 
@@ -222,6 +278,65 @@ impl<'a> VerifiedEntity<'a> {
     /// Gets the entity handle.
     pub fn entity(&self) -> Entity {
         self.inner
+    }
+}
+
+pub struct Empty;
+
+pub struct Entry<T: Component, S: Storage<T>, P: Set> {
+    data: S,
+    parent: P,
+    _marker: PhantomData<T>,
+}
+
+pub trait Set: Sized {
+    fn push<T: Component>(self) -> Entry<T, T::Storage, Self>
+    where T::Storage: Default {
+        Entry {
+            data: T::Storage::default(),
+            parent: self,
+            _marker: PhantomData,
+        }
+    }
+    
+    fn push_storage<T: Component, S: Storage<T>>(self, storage: S) -> Entry<T, S, Self> {
+        Entry {
+            data: storage,
+            parent: self,
+            _marker: PhantomData,
+        }
+    }
+    
+    
+    fn storage<T: Component>(&self) -> &T::Storage;
+    fn storage_mut<T: Component>(&mut self) -> &mut T::Storage;
+}
+
+impl Set for Empty {
+    fn storage<T: Component>(&self) -> &T::Storage {
+        panic!("Attempted access of component not in set.");
+    }
+    
+    fn storage_mut<T: Component>(&mut self) -> &mut T::Storage {
+        panic!("Attempted access of component not in set.");
+    }
+}
+
+impl<T: Component, S: Storage<T>, P: Set> Set for Entry<T, S, P> {
+    fn storage<C: Component>(&self) -> &C::Storage {
+        if TypeId::of::<T>() == TypeId::of::<C>() {
+            unsafe { mem::transmute(&self.data) }
+        } else {
+            self.parent.storage::<C>()
+        }
+    }
+    
+    fn storage_mut<C: Component>(&mut self) -> &mut C::Storage {
+        if TypeId::of::<T>() == TypeId::of::<C>() {
+            unsafe { mem::transmute(&mut self.data) }
+        } else {
+            self.parent.storage_mut::<C>()
+        }
     }
 }
 
