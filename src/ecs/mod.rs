@@ -8,11 +8,13 @@ use std::mem;
 const ID_BITS: usize = 24;
 const MIN_UNUSED: usize = 1024;
 
+pub mod impls;
+
 /// A component is a piece of raw data which is associated with an entity.
 ///
 /// "Systems" will typically iterate over all entities with a specific set of components,
 /// performing some action for each.
-pub trait Component: Any + Copy {
+pub trait Component: Any + Copy + Sync {
     /// The data structure which stores component of this type.
     ///
     /// By default, this will be the `DefaultStorage` structure,
@@ -24,16 +26,15 @@ pub trait Component: Any + Copy {
     type Storage: Storage<Self>;
 }
 
-impl<T: Any + Copy> Component for T {
+impl<T: Any + Copy + Sync> Component for T {
     default type Storage = DefaultStorage<Self>;
 }
 
 /// Component data storage.
 ///
 /// In general, this will be used through `DefaultStorage`, but some components
-/// can be more conveniently used through special data structures.
-/// In the future, it will be possible to define custom filters.
-pub trait Storage<T: Component> {
+/// can be more conveniently accessed through special data structures.
+pub trait Storage<T: Component>: Sync {
     /// Set the component data for an entity.
     fn set(&mut self, e: VerifiedEntity, data: T);
     
@@ -59,6 +60,35 @@ pub trait Storage<T: Component> {
     
     /// Return an iterator over all entities this stores data for.
     fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a>;
+}
+
+/// Filters are used to test properties of entities' data.
+///
+/// The most common kind of filter is to test whether an entity has a specific
+/// component. This is implemented with the `Has` filter. All other filters must
+/// be sub-filters of `Has`.
+/// Queries are composed of multiple filters, which each entity will be tested
+/// against in turn.
+pub trait Filter {
+    type Component: Component;
+    
+    /// The predicate for entities to fulfill.
+    /// 
+    /// This may only return true if the entity has the given component.
+    fn pred(&self, &<Self::Component as Component>::Storage, VerifiedEntity) -> bool;
+}
+
+/// A filter which tests whether an entity has a specific component.
+pub struct Has<T: Component> {
+    _marker: PhantomData<T>,
+}
+
+impl<T: Component> Filter for Has<T> {
+    type Component = T;
+    
+    fn pred(&self, storage: &T::Storage, e: VerifiedEntity) -> bool {
+        storage.has(e)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -337,6 +367,81 @@ impl<T: Component, S: Storage<T>, P: Set> Set for Entry<T, S, P> {
         } else {
             self.parent.storage_mut::<C>()
         }
+    }
+}
+
+/// A collection of filters.
+///
+/// This technically can be user-implemented, but this whole section
+/// of the API is so intertwined and complex that it's probably best not to.
+/// Re-implementation of Pipeline will require implementations of `PipelineFactory`
+/// and `Push`.
+pub trait Pipeline<'a>: Sized {
+    type Item: 'a;
+    
+    /// Consume self along with handles to ECS state to pass all entities
+    /// fulfilling the pipeline's predicates to the functions along with
+    /// relavant component data.
+    fn for_each<F, S: Set>(self, &'a S, &'a EntityManager, F)
+    where F: 'a + Sync + Fn(VerifiedEntity, Self::Item);
+}
+
+/// Convenience trait for extending tuples of filters.
+pub trait Push<T> {
+    type Output;
+    
+    fn push(self, T) -> Self::Output;
+}
+
+/// For creating pipelines.
+///
+/// This is how we transform tuples of component
+/// types into tuples of "Has" filters. This can be implemented
+/// by the user, but it won't integrate with the Query.
+pub trait PipelineFactory {
+    type Pipeline: for<'a> Pipeline<'a>;
+    
+    fn create() -> Self::Pipeline;
+}
+
+/// A query is a collection of filters coupled with handles
+/// to the state of the ECS.
+pub struct Query<'a, S: Set + 'a, P: 'a> {
+    set: &'a S,
+    entities: &'a EntityManager,
+    pipeline: P,
+}
+
+impl<'a, S: 'a + Set, P: 'a + Pipeline<'a>> Query<'a, S, P> {
+    /// Add another component to the query. When "for_each" is called,
+    /// this will filter out all entities without this component.
+    ///
+    /// Adding a component more than once may lead to deadlock or panic.
+    #[inline]
+    pub fn with<T: Component>(self) -> Query<'a, S, <P as Push<Has<T>>>::Output>
+    where P: Push<Has<T>>, <P as Push<Has<T>>>::Output: Pipeline<'a> {
+        self.with_filtered(Has { _marker: PhantomData })
+    }
+    
+    /// Add a component to the query to be specially filtered. This is useful for those
+    /// cases where components are stored in a special data structure.
+    ///
+    /// Adding a component more than once may lead to deadlock or panic,
+    #[inline]
+    pub fn with_filtered<T: Filter>(self, filter: T) -> Query<'a, S, <P as Push<T>>::Output>
+    where P: Push<T>, <P as Push<T>>::Output: Pipeline<'a> {
+        Query {
+            set: self.set,
+            entities: self.entities,
+            pipeline: self.pipeline.push(filter)
+        }
+    }
+    
+    /// Perform an action for each entity which fits the properties of 
+    /// the filter.
+    pub fn for_each<F>(self, f: F)
+    where F: 'a + Sync + Fn(VerifiedEntity, <P as Pipeline>::Item) {
+        self.pipeline.for_each(self.set, self.entities, f);
     }
 }
 
