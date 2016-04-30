@@ -4,6 +4,7 @@ use std::any::{Any, TypeId};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Deref;
 
 const ID_BITS: usize = 24;
 const MIN_UNUSED: usize = 1024;
@@ -106,7 +107,10 @@ impl Index {
     }
 }
 
-// Component data storage.
+/// The default component data storage.
+///
+/// Data is stored contiguously and can be iterated
+/// over very quickly.
 pub struct DefaultStorage<T: Component> {
     // data vector -- this is tightly packed.
     data: Vec<T>,
@@ -311,16 +315,33 @@ impl<'a> VerifiedEntity<'a> {
     }
 }
 
+impl<'a> Deref for VerifiedEntity<'a> {
+    type Target = Entity;
+    
+    fn deref(&self) -> &Entity {
+        &self.inner
+    }
+}
+
+/// The empty set.
 pub struct Empty;
 
-pub struct Entry<T: Component, S: Storage<T>, P: Set> {
-    data: S,
+/// A non-empty set.
+pub struct Entry<T: Component, P: Set> {
+    data: T::Storage,
     parent: P,
     _marker: PhantomData<T>,
 }
 
+/// A set of component storage data structures.
+/// 
+/// This is implemented as a recursive-variadic
+/// data structure, which will allow for instant access of
+/// component storage. The major downside is that attempted access
+/// of components not in the set will resolve to a panic at runtime
+/// rather than a compile error.
 pub trait Set: Sized {
-    fn push<T: Component>(self) -> Entry<T, T::Storage, Self>
+    fn push<T: Component>(self) -> Entry<T, Self>
     where T::Storage: Default {
         Entry {
             data: T::Storage::default(),
@@ -329,7 +350,7 @@ pub trait Set: Sized {
         }
     }
     
-    fn push_storage<T: Component, S: Storage<T>>(self, storage: S) -> Entry<T, S, Self> {
+    fn push_storage<T: Component>(self, storage: T::Storage) -> Entry<T, Self> {
         Entry {
             data: storage,
             parent: self,
@@ -352,7 +373,7 @@ impl Set for Empty {
     }
 }
 
-impl<T: Component, S: Storage<T>, P: Set> Set for Entry<T, S, P> {
+impl<T: Component, P: Set> Set for Entry<T, P> {
     fn storage<C: Component>(&self) -> &C::Storage {
         if TypeId::of::<T>() == TypeId::of::<C>() {
             unsafe { mem::transmute(&self.data) }
