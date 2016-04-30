@@ -90,8 +90,10 @@ macro_rules! pipeline_impl {
         impl<'a> Pipeline<'a> for () {
             type Item = ();
             
-            fn for_each<F, S: Set>(self, _: &'a S, _: &'a EntityManager, _: F)
-            where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) {}
+            fn for_each<F, U: Send, S: Set>(self, _: &'a S, _: &'a EntityManager, _: F) -> Vec<U>
+            where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {
+                Vec::new()
+            }
         }
     };
     
@@ -101,8 +103,8 @@ macro_rules! pipeline_impl {
             type Item = (&'a <$f_id as Filter>::Component, $(&'a <$id as Filter>::Component,)*);
             
             #[allow(unused_mut)]
-            fn for_each<OP, SET: Set>(self, set: &'a SET, entities: &'a EntityManager, f: OP)
-            where OP: 'a + Sync + Fn(VerifiedEntity, Self::Item) {
+            fn for_each<OP, U: Send, SET: Set>(self, set: &'a SET, entities: &'a EntityManager, f: OP) -> Vec<U>
+            where OP: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {
                 // get a tuple of all the storage containers, one for each type.
                 // in a multithreaded implementation, these are going to be MutexGuards.
                 // it's important that we don't lock the mutexes more than once.
@@ -118,16 +120,17 @@ macro_rules! pipeline_impl {
                 )*
                 
                 // for each entry that is still Some (that is, the entity within passes all filters)
-                for e in entities.into_iter().filter_map(|e| e) {
+                entities.into_iter().filter_map(|e| e).map(|e| {
                     // get the data by looking into the storage containers,
                     let data = (
                         access!(storages; $f_num).get(e).unwrap(),
                         $(access!(storages; $num).get(e).unwrap(),)*
                     );
                     
-                    // and call the function provided.
-                    f(e, data);
-                }
+                    // and call the function provided, collecting the outputs
+                    // for a "write" phase.
+                    f(e, data)
+                }).collect()
             }
         } 
     };

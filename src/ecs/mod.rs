@@ -323,6 +323,55 @@ impl<'a> Deref for VerifiedEntity<'a> {
     }
 }
 
+/// The world stores component and entity data.
+pub struct World<S: Set> {
+    data: S,
+    entities: EntityManager,
+}
+
+pub struct WorldHandle<'a, S: 'a + Set> {
+    data: &'a S,
+    entities: &'a EntityManager,
+}
+
+impl<'a, S: 'a + Set> WorldHandle<'a, S> {
+    /// Create a query against the world data.
+    ///
+    /// # Examples
+    /// ```
+    /// use snorkium::ecs::*;
+    /// #[derive(Clone, Copy)]
+    /// struct Position(f32, f32);
+    /// #[derive(Clone, Copy)]
+    /// struct Dot;
+    ///     
+    /// // imagine this draws a dot at the position.
+    /// fn draw_dot(_: &Position) { }
+    /// 
+    /// struct DotSystem;
+    /// impl System for DotSystem {
+    ///     // draw a dot for each entity with a position and the zero-sized dot component.
+    ///     fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>) {
+    ///         wh.query::<(Position, Dot)>().for_each(|e, (p, d)| {
+    ///             draw_dot(p); 
+    ///         });
+    ///     }
+    /// }
+    /// ```
+    pub fn query<F>(&self) -> Query<'a, S, F::Pipeline>
+    where F: PipelineFactory {
+        Query {
+            set: self.data,
+            entities: self.entities,
+            pipeline: F::create(),
+        }
+    }
+}
+
+pub trait System: Send + Sync {
+    fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>);
+}
+
 /// The empty set.
 pub struct Empty;
 
@@ -340,17 +389,13 @@ pub struct Entry<T: Component, P: Set> {
 /// component storage. The major downside is that attempted access
 /// of components not in the set will resolve to a panic at runtime
 /// rather than a compile error.
-pub trait Set: Sized {
+pub trait Set: Sized + Sync {
     fn push<T: Component>(self) -> Entry<T, Self>
     where T::Storage: Default {
-        Entry {
-            data: T::Storage::default(),
-            parent: self,
-            _marker: PhantomData,
-        }
+        self.push_custom(Default::default())
     }
     
-    fn push_storage<T: Component>(self, storage: T::Storage) -> Entry<T, Self> {
+    fn push_custom<T: Component>(self, storage: T::Storage) -> Entry<T, Self> {
         Entry {
             data: storage,
             parent: self,
@@ -402,9 +447,10 @@ pub trait Pipeline<'a>: Sized {
     
     /// Consume self along with handles to ECS state to pass all entities
     /// fulfilling the pipeline's predicates to the functions along with
-    /// relavant component data.
-    fn for_each<F, S: Set>(self, &'a S, &'a EntityManager, F)
-    where F: 'a + Sync + Fn(VerifiedEntity, Self::Item);
+    /// relevant component data. This will output a vector of the returned
+    /// outputs from the function.
+    fn for_each<F, U: Send, S: Set>(self, &'a S, &'a EntityManager, F) -> Vec<U>
+    where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U;
 }
 
 /// Convenience trait for extending tuples of filters.
@@ -460,9 +506,9 @@ impl<'a, S: 'a + Set, P: 'a + Pipeline<'a>> Query<'a, S, P> {
     
     /// Perform an action for each entity which fits the properties of 
     /// the filter.
-    pub fn for_each<F>(self, f: F)
-    where F: 'a + Sync + Fn(VerifiedEntity, <P as Pipeline>::Item) {
-        self.pipeline.for_each(self.set, self.entities, f);
+    pub fn for_each<F, U: Send>(self, f: F) -> Vec<U>
+    where F: 'a + Sync + Fn(VerifiedEntity, <P as Pipeline<'a>>::Item) -> U {
+        self.pipeline.for_each(self.set, self.entities, f)
     }
 }
 
