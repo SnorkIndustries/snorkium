@@ -4,6 +4,7 @@ use std::any::{Any, TypeId};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::{Mutex, MutexGuard};
 use std::ops::Deref;
 
 const ID_BITS: usize = 24;
@@ -92,30 +93,15 @@ impl<T: Component> Filter for Has<T> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Index {
-    off: usize,
-    entity: Entity,
-}
-
-impl Index {
-    fn new(off: usize, entity: Entity) -> Self {
-        Index {
-            off: off,
-            entity: entity,
-        }
-    }
-}
-
 /// The default component data storage.
 ///
 /// Data is stored contiguously and can be iterated
 /// over very quickly.
 pub struct DefaultStorage<T: Component> {
     // data vector -- this is tightly packed.
-    data: Vec<T>,
+    data: Vec<(Entity, T)>,
     // loosely packed lookup table mapping entity ids to data indices.
-    indices: Vec<Option<Index>>,
+    indices: Vec<Option<usize>>,
     // unused indices in the data table.
     unused: VecDeque<usize>,
 }
@@ -138,74 +124,74 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
             self.indices.push(None);
         }
         
+        let data = (e.entity(), data);
+        
         if let Some(idx) = self.indices[id] {
-            self.data[idx.off] = data;
-            self.indices[id].unwrap().entity = e.entity();
-        } else if let Some(off) = self.unused.pop_front() {
-            self.data[off] = data;
-            self.indices[id] = Some(Index::new(off, e.entity()));
+            self.data[idx] = data;
+        } else if let Some(idx) = self.unused.pop_front() {
+            self.data[idx] = data;
+            self.indices[id] = Some(idx);
         } else {
             self.data.push(data);
-            self.indices[id] = Some(Index::new(self.data.len() - 1, e.entity()));
+            self.indices[id] = Some(self.data.len());
         }
     }
     
     fn has(&self, e: VerifiedEntity) -> bool {
-        if let Some(&Some(idx)) = self.indices.get(e.entity().id() as usize) {
-            idx.entity == e.entity()
-        } else {
-            false
+        match self.indices.get(e.entity().id() as usize) {
+            Some(&Some(idx)) => {
+                self.data[idx].0 == e.entity()
+            }
+            _ => false,
         }
     }
     
     /// Get a reference to an entity's data.
     fn get(&self, e: VerifiedEntity) -> Option<&T> {
-        match self.indices.get(e.entity().id() as usize) {
-            Some(&Some(idx)) if idx.entity == e.entity() => {
-                Some(&self.data[idx.off])
+        if let Some(&Some(idx)) = self.indices.get(e.entity().id() as usize) {
+            if self.data[idx].0 == e.entity() {
+                return Some(&self.data[idx].1)
             }
-            _ => None,
         }
+        
+        None
     }
     
     /// Get a mutable reference to an entity's data.
     fn get_mut(&mut self, e: VerifiedEntity) -> Option<&mut T> {
-        match self.indices.get(e.entity().id() as usize) {
-            Some(&Some(idx)) if idx.entity == e.entity() => {
-                Some(&mut self.data[idx.off])
+        if let Some(&Some(idx)) = self.indices.get(e.entity().id() as usize) {
+            if self.data[idx].0 == e.entity() {
+                return Some(&mut self.data[idx].1)
             }
-            _ => None,
         }
+        
+        None
     }
     
     /// Remove an entity's data, returning it by value if it existed.
     fn remove(&mut self, e: VerifiedEntity) -> Option<T> {
-        match self.indices.get(e.entity().id() as usize) {
-            Some(&Some(idx)) => {
-                self.indices[e.entity().id() as usize] = None;
-                self.unused.push_back(idx.off);
-                
-                if idx.entity == e.entity() {
-                    Some(self.data[idx.off])
-                } else {
-                    None
-                }
-            }       
-            _ => None,
+        let id = e.entity().id() as usize;
+        if let Some(&Some(idx)) = self.indices.get(id) {
+            self.unused.push_back(idx);
+            self.indices[id] = None;
+            
+            if self.data[idx].0 == e.entity() {
+                return Some(self.data[idx].1)
+            }
         }
+        
+        None
     }
     
     fn destroy(&mut self, e: Entity) {
         if let Some(&Some(idx)) = self.indices.get(e.id() as usize) {
             self.indices[e.id() as usize] = None;
-            self.unused.push_back(idx.off);
+            self.unused.push_back(idx);
         }
     }
     
     fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a> {
-        let iter = self.indices.iter().filter_map(|idx| {
-            idx.as_ref().map(|inner| inner.entity)
-        });
+        let iter = self.data.iter().map(|&(e, _)| e);
         
         Box::new(iter)
     }
