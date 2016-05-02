@@ -1,6 +1,7 @@
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-    }
-}
+#![feature(specialization)]
+
+extern crate glutin;
+extern crate gl;
+extern crate rayon;
+
+pub mod ecs;
