@@ -1,22 +1,23 @@
 //! A multithreaded Entity Component System (ECS)
 
-use std::any::{Any, TypeId};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::mem;
-use std::sync::{Mutex, MutexGuard};
 use std::ops::Deref;
+
+use self::set::*;
+use self::query::*;
 
 const ID_BITS: usize = 24;
 const MIN_UNUSED: usize = 1024;
 
-pub mod impls;
+pub mod query;
+pub mod set;
 
 /// A component is a piece of raw data which is associated with an entity.
 ///
 /// "Systems" will typically iterate over all entities with a specific set of components,
 /// performing some action for each.
-pub trait Component: Any + Copy + Sync {
+pub trait Component: 'static + Copy + Send + Sync {
     /// The data structure which stores component of this type.
     ///
     /// By default, this will be the `DefaultStorage` structure,
@@ -28,7 +29,7 @@ pub trait Component: Any + Copy + Sync {
     type Storage: Storage<Self>;
 }
 
-impl<T: Any + Copy + Sync> Component for T {
+impl<T: 'static + Copy + Send + Sync> Component for T {
     default type Storage = DefaultStorage<Self>;
 }
 
@@ -36,7 +37,7 @@ impl<T: Any + Copy + Sync> Component for T {
 ///
 /// In general, this will be used through `DefaultStorage`, but some components
 /// can be more conveniently accessed through special data structures.
-pub trait Storage<T: Component>: Sync {
+pub trait Storage<T: Component>: Sync + Send {
     /// Set the component data for an entity.
     fn set(&mut self, e: VerifiedEntity, data: T);
     
@@ -62,35 +63,6 @@ pub trait Storage<T: Component>: Sync {
     
     /// Return an iterator over all entities this stores data for.
     fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a>;
-}
-
-/// Filters are used to test properties of entities' data.
-///
-/// The most common kind of filter is to test whether an entity has a specific
-/// component. This is implemented with the `Has` filter. All other filters must
-/// be sub-filters of `Has`.
-/// Queries are composed of multiple filters, which each entity will be tested
-/// against in turn.
-pub trait Filter {
-    type Component: Component;
-    
-    /// The predicate for entities to fulfill.
-    /// 
-    /// This may only return true if the entity has the given component.
-    fn pred(&self, &<Self::Component as Component>::Storage, VerifiedEntity) -> bool;
-}
-
-/// A filter which tests whether an entity has a specific component.
-pub struct Has<T: Component> {
-    _marker: PhantomData<T>,
-}
-
-impl<T: Component> Filter for Has<T> {
-    type Component = T;
-    
-    fn pred(&self, storage: &T::Storage, e: VerifiedEntity) -> bool {
-        storage.has(e)
-    }
 }
 
 /// The default component data storage.
@@ -346,156 +318,13 @@ impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     /// ```
     pub fn query<F>(&self) -> Query<'a, S, F::Pipeline>
     where F: PipelineFactory {
-        Query {
-            set: self.data,
-            entities: self.entities,
-            pipeline: F::create(),
-        }
+        Query::new(&self.data, &self.entities, F::create())
     }
 }
 
+/// Systems are where the bulk of the work of the ECS is done.
 pub trait System: Send + Sync {
     fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>);
-}
-
-/// The empty set.
-pub struct Empty;
-
-/// A non-empty set.
-pub struct Entry<T: Component, P: Set> {
-    data: T::Storage,
-    parent: P,
-    _marker: PhantomData<T>,
-}
-
-/// A set of component storage data structures.
-/// 
-/// This is implemented as a recursive-variadic
-/// data structure, which will allow for instant access of
-/// component storage. The major downside is that attempted access
-/// of components not in the set will resolve to a panic at runtime
-/// rather than a compile error.
-pub trait Set: Sized + Sync {
-    fn push<T: Component>(self) -> Entry<T, Self>
-    where T::Storage: Default {
-        self.push_custom(Default::default())
-    }
-    
-    fn push_custom<T: Component>(self, storage: T::Storage) -> Entry<T, Self> {
-        Entry {
-            data: storage,
-            parent: self,
-            _marker: PhantomData,
-        }
-    }
-    
-    
-    fn storage<T: Component>(&self) -> &T::Storage;
-    fn storage_mut<T: Component>(&mut self) -> &mut T::Storage;
-}
-
-impl Set for Empty {
-    fn storage<T: Component>(&self) -> &T::Storage {
-        panic!("Attempted access of component not in set.");
-    }
-    
-    fn storage_mut<T: Component>(&mut self) -> &mut T::Storage {
-        panic!("Attempted access of component not in set.");
-    }
-}
-
-impl<T: Component, P: Set> Set for Entry<T, P> {
-    fn storage<C: Component>(&self) -> &C::Storage {
-        if TypeId::of::<T>() == TypeId::of::<C>() {
-            unsafe { mem::transmute(&self.data) }
-        } else {
-            self.parent.storage::<C>()
-        }
-    }
-    
-    fn storage_mut<C: Component>(&mut self) -> &mut C::Storage {
-        if TypeId::of::<T>() == TypeId::of::<C>() {
-            unsafe { mem::transmute(&mut self.data) }
-        } else {
-            self.parent.storage_mut::<C>()
-        }
-    }
-}
-
-/// A collection of filters.
-///
-/// This technically can be user-implemented, but this whole section
-/// of the API is so intertwined and complex that it's probably best not to.
-/// Re-implementation of Pipeline will require implementations of `PipelineFactory`
-/// and `Push`.
-pub trait Pipeline<'a>: Sized {
-    type Item: 'a;
-    
-    /// Consume self along with handles to ECS state to pass all entities
-    /// fulfilling the pipeline's predicates to the functions along with
-    /// relevant component data. This will output a vector of the returned
-    /// outputs from the function.
-    fn for_each<F, U: Send, S: Set>(self, &'a S, &'a EntityManager, F) -> Vec<U>
-    where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U;
-}
-
-/// Convenience trait for extending tuples of filters.
-pub trait Push<T> {
-    type Output;
-    
-    fn push(self, T) -> Self::Output;
-}
-
-/// For creating pipelines.
-///
-/// This is how we transform tuples of component
-/// types into tuples of "Has" filters. This can be implemented
-/// by the user, but it won't integrate with the Query.
-pub trait PipelineFactory {
-    type Pipeline: for<'a> Pipeline<'a>;
-    
-    fn create() -> Self::Pipeline;
-}
-
-/// A query is a collection of filters coupled with handles
-/// to the state of the ECS.
-pub struct Query<'a, S: Set + 'a, P: 'a> {
-    set: &'a S,
-    entities: &'a EntityManager,
-    pipeline: P,
-}
-
-impl<'a, S: 'a + Set, P: 'a + Pipeline<'a>> Query<'a, S, P> {
-    /// Add another component to the query. When "for_each" is called,
-    /// this will filter out all entities without this component.
-    ///
-    /// Adding a component more than once may lead to deadlock or panic.
-    #[inline]
-    pub fn with<T: Component>(self) -> Query<'a, S, <P as Push<Has<T>>>::Output>
-    where P: Push<Has<T>>, <P as Push<Has<T>>>::Output: Pipeline<'a> {
-        self.with_filtered(Has { _marker: PhantomData })
-    }
-    
-    /// Add a component to the query to be specially filtered. This is useful for those
-    /// cases where components are stored in a special data structure.
-    ///
-    /// Adding a component more than once may lead to deadlock or panic,
-    #[inline]
-    pub fn with_filtered<T: Filter>(self, filter: T) -> Query<'a, S, <P as Push<T>>::Output>
-    where P: Push<T>, <P as Push<T>>::Output: Pipeline<'a> {
-        Query {
-            set: self.set,
-            entities: self.entities,
-            pipeline: self.pipeline.push(filter)
-        }
-    }
-    
-    /// Perform an action for each entity which fits the properties of 
-    /// the filter.
-    pub fn for_each<F, U: Send>(self, f: F) -> Vec<U>
-    where F: 'a + Sync + Fn(VerifiedEntity, <P as Pipeline<'a>>::Item) -> U {
-        self.pipeline.for_each(self.set, self.entities, f)
-    }
 }
 
 #[cfg(test)]
