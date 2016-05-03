@@ -20,6 +20,9 @@ pub trait Filter {
 }
 
 /// A filter which tests whether an entity has a specific component.
+/// 
+/// These are automatically created from the implementation of `PipelineFactory`
+/// for tuples of components. See `WorldHandle::query()` for more details.
 pub struct Has<T: Component> {
     _marker: PhantomData<T>,
 }
@@ -70,6 +73,9 @@ pub trait PipelineFactory {
 
 /// A query is a collection of filters coupled with handles
 /// to the state of the ECS.
+///
+/// This are used to select over a specific group of entities, and perform 
+/// an action for each.
 pub struct Query<'a, S: Set + 'a, P: 'a> {
     set: &'a S,
     entities: &'a EntityManager,
@@ -113,11 +119,42 @@ impl<'a, S: 'a + Set, P> Query<'a, S, P> where P: 'a + for<'b> Pipeline<'b> {
     
     /// Perform an action for each entity which fits the properties of 
     /// the filter.
-    pub fn for_each<F, U: Send>(self, f: F) -> Vec<U>
+    ///
+    /// This function can be thought of as the "read" phase -- 
+    /// following the Rust idiom of iterating through a collection,
+    /// and creating a list of actions to perform during the "write"
+    /// phase, where state is actually mutated.
+    ///
+    /// Since this function doesn't have the capability of mutating global
+    /// state, it can potentially be distributed across cores for data 
+    /// parallelism.
+    ///
+    /// This returns a set of locks for component storage acquired for the
+    /// necessary components as well as the vector of actions produced.
+    /// by the supplied closure.
+    pub fn for_each<F, U: Send>(self, f: F) -> QueryResult<U, <<P as Pipeline<'a>>::LockGroup as LockGroup<'a>>::Subset>
     where F: Sync + for<'r> Fn(VerifiedEntity, <P as Pipeline<'r>>::Item) -> U {
         let subset = self.set.lock_subset::<P::LockGroup>();
-        self.pipeline.for_each(&subset, self.entities, f)
+        let actions = self.pipeline.for_each(&subset, self.entities, f);
+        QueryResult {
+            actions: actions,
+            locks: subset,
+        }
     }
+}
+
+/// The result of a query: the actions produced along with a set of handles
+/// to the relevant components' data storage.
+///
+/// Since performing queries necessarily involves locking the mutexes of 
+/// the components being iterated over, it doesn't make sense just to throw
+/// those locks away. The user needs to transform the list of actions 
+/// produced by the query into state changes on the world. For this reason
+/// it would be wasteful to unlock the storage mutexes as the user would
+/// need to lock them again immediately.
+pub struct QueryResult<Action, Subset: LockedSubset> {
+    pub actions: Vec<Action>,
+    pub locks: Subset,
 }
 
 // implementations for tuples.
@@ -126,6 +163,7 @@ macro_rules! as_expr {
     ($e: expr) => { $e }
 }
 
+// field access macro.
 macro_rules! access {
     ($e: expr; $id: tt) => { as_expr!($e.$id) }
 }
