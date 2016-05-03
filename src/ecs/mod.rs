@@ -296,6 +296,14 @@ pub struct WorldHandle<'a, S: 'a + Set> {
 impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     /// Create a query against the world data.
     ///
+    /// This function takes a type parameter bounded by `PipelineFactory`.
+    /// In practice, this will be a tuple of component types, e.g.
+    /// `(A, B, C)` or `(A, B, C, D, E, F)`. These tuples cannot be arbitrarily
+    /// large due to limitations in the Rust compiler, but they currently go up
+    /// to 6 members. Do not specify the same component type more than once,
+    /// since this will lead to a panic or deadlock when attempting to evaluate
+    /// the query.
+    ///
     /// # Examples
     /// ```
     /// # use snorkium::ecs::*;

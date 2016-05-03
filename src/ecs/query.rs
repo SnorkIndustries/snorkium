@@ -72,10 +72,13 @@ pub trait PipelineFactory {
 }
 
 /// A query is a collection of filters coupled with handles
-/// to the state of the ECS.
+/// to the state of the ECS. 
 ///
-/// This are used to select over a specific group of entities, and perform 
-/// an action for each.
+/// Queries cannot be used to mutate overarching state.
+///
+/// They are used to select over a specific group of entities, and determine
+/// an action to be performed for each. Then, a user will iterate over each of
+/// these actions and alter the global state.
 pub struct Query<'a, S: Set + 'a, P: 'a> {
     set: &'a S,
     entities: &'a EntityManager,
