@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use self::set::*;
 use self::query::*;
 
 const ID_BITS: usize = 24;
@@ -12,6 +11,8 @@ const MIN_UNUSED: usize = 1024;
 
 pub mod query;
 pub mod set;
+
+pub use self::set::Set;
 
 /// A component is a piece of raw data which is associated with an entity.
 ///
@@ -297,7 +298,7 @@ impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     ///
     /// # Examples
     /// ```
-    /// use snorkium::ecs::*;
+    /// # use snorkium::ecs::*;
     /// #[derive(Clone, Copy)]
     /// struct Position(f32, f32);
     /// #[derive(Clone, Copy)]
@@ -310,7 +311,10 @@ impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     /// impl System for DotSystem {
     ///     // draw a dot for each entity with a position and the zero-sized dot component.
     ///     fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>) {
-    ///         wh.query::<(Position, Dot)>().for_each(|e, (p, d)| {
+    ///         // when https://github.com/rust-lang/rust/issues/33364 is fixed,
+    ///         // you'll be able to match on the tuple inside the closure arguments list.
+    ///         wh.query::<(Position, Dot)>().for_each(|e, item| {
+    ///             let (p, _) = item;
     ///             draw_dot(p); 
     ///         });
     ///     }

@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use super::*;
-use super::set::{Set, LockedSubset};
+use super::set::{LockGroup, LockedSubset};
 
 /// Filters are used to test properties of entities' data.
 ///
@@ -40,13 +40,14 @@ impl<T: Component> Filter for Has<T> {
 /// and `Push`.
 pub trait Pipeline<'a>: Sized {
     type Item: 'a;
+    type LockGroup: for<'b> LockGroup<'b>;
     
     /// Consume self along with handles to ECS state to pass all entities
     /// fulfilling the pipeline's predicates to the functions along with
     /// relevant component data. This will output a vector of the returned
     /// outputs from the function.
-    fn for_each<F, U: Send, S: LockedSubset>(self, &S, &EntityManager, F) -> Vec<U>
-    where F: Sync + for <'b> Fn(VerifiedEntity, <Self as Pipeline<'b>>::Item) -> U;
+    fn for_each<F, U: Send, S: LockedSubset>(self, &'a S, &'a EntityManager, F) -> Vec<U>
+    where F: Sync + Fn(VerifiedEntity, Self::Item) -> U;
 }
 
 /// Convenience trait for extending tuples of filters.
@@ -75,7 +76,7 @@ pub struct Query<'a, S: Set + 'a, P: 'a> {
     pipeline: P,
 }
 
-impl<'a, S: 'a + Set, P: 'a + Pipeline<'a>> Query<'a, S, P> {
+impl<'a, S: 'a + Set, P> Query<'a, S, P> where P: 'a + for<'b> Pipeline<'b> {
     /// Create a new query. Use of `WorldHandle::query()` is advised
     /// over this.
     pub fn new(s: &'a S, entities: &'a EntityManager, pipeline: P) -> Self {
@@ -113,11 +114,9 @@ impl<'a, S: 'a + Set, P: 'a + Pipeline<'a>> Query<'a, S, P> {
     /// Perform an action for each entity which fits the properties of 
     /// the filter.
     pub fn for_each<F, U: Send>(self, f: F) -> Vec<U>
-    where F: Sync + for<'b> Fn(VerifiedEntity, <P as Pipeline<'b>>::Item) -> U {
-        // TODO: amend Pipeline so that we can get a LockGroup to pass to lock_subset.
-        // TODO: have for_each return the locked subset along with the items.
-        let empty = ::ecs::set::Empty;
-        self.pipeline.for_each(&empty, self.entities, f)
+    where F: Sync + for<'r> Fn(VerifiedEntity, <P as Pipeline<'r>>::Item) -> U {
+        let subset = self.set.lock_subset::<P::LockGroup>();
+        self.pipeline.for_each(&subset, self.entities, f)
     }
 }
 
@@ -163,10 +162,10 @@ macro_rules! factory {
     };
 }
 
-// factory!(A B C D E F);
-// factory!(A B C D E);
-// factory!(A B C D);
-// factory!(A B C);
+factory!(A B C D E F);
+factory!(A B C D E);
+factory!(A B C D);
+factory!(A B C);
 factory!(A B);
 factory!(A);
 factory!();
@@ -208,9 +207,10 @@ macro_rules! pipeline_impl {
     () => {
         impl<'a> Pipeline<'a> for () {
             type Item = ();
+            type LockGroup = ();
             
-            fn for_each<F, U: Send, S: LockedSubset>(self, _: &S, _: &EntityManager, _: F) -> Vec<U>
-            where F: 'a + Sync + for<'b> Fn(VerifiedEntity, <Self as Pipeline<'b>>::Item) -> U {
+            fn for_each<F, U: Send, S: LockedSubset>(self, _: &'a S, _: &'a EntityManager, _: F) -> Vec<U>
+            where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {
                 Vec::new()
             }
         }
@@ -219,11 +219,12 @@ macro_rules! pipeline_impl {
     ($f_id: ident $f_num: tt $($id: ident $num: tt)*) => {
         impl<'a, $f_id: Filter, $($id: Filter,)*> Pipeline<'a> for
         ($f_id, $($id,)*) {
-            type Item = (&'a <$f_id as Filter>::Component, $(&'a <$id as Filter>::Component,)*);
+            type Item = (&'a $f_id::Component, $(&'a $id::Component,)*);
+            type LockGroup = ($f_id::Component, $($id::Component,)*);
             
             #[allow(unused_mut)]
-            fn for_each<OP, U: Send, SET: LockedSubset>(self, set: &SET, entities: &EntityManager, f: OP) -> Vec<U>
-            where OP: 'a + Sync + for<'b> Fn(VerifiedEntity, <Self as Pipeline<'b>>::Item) -> U {  
+            fn for_each<OP, U: Send, SET: LockedSubset>(self, set: &'a SET, entities: &'a EntityManager, f: OP) -> Vec<U>
+            where OP: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {  
                 // it's ok to unwrap the calls to get_storage() since this function is called with a subset
                 // that has been locked with this pipeline in mind.
                               
@@ -253,10 +254,10 @@ macro_rules! pipeline_impl {
     };
 }
 
-// pipeline_impl!(A 0 B 1 C 2 D 3 E 4 F 5);
-// pipeline_impl!(A 0 B 1 C 2 D 3 E 4);
-// pipeline_impl!(A 0 B 1 C 2 D 3);
-// pipeline_impl!(A 0 B 1 C 2);
+pipeline_impl!(A 0 B 1 C 2 D 3 E 4 F 5);
+pipeline_impl!(A 0 B 1 C 2 D 3 E 4);
+pipeline_impl!(A 0 B 1 C 2 D 3);
+pipeline_impl!(A 0 B 1 C 2);
 pipeline_impl!(A 0 B 1);
 pipeline_impl!(A 0);
 pipeline_impl!();
