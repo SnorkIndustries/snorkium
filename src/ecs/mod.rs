@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::RwLock;
 
 use self::query::*;
 
@@ -285,12 +286,12 @@ impl<'a> Deref for VerifiedEntity<'a> {
 /// The world stores component and entity data.
 pub struct World<S: Set> {
     data: S,
-    entities: EntityManager,
+    entities: RwLock<EntityManager>,
 }
 
 pub struct WorldHandle<'a, S: 'a + Set> {
     data: &'a S,
-    entities: &'a EntityManager,
+    entities: &'a RwLock<EntityManager>,
 }
 
 impl<'a, S: 'a + Set> WorldHandle<'a, S> {
@@ -303,6 +304,16 @@ impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     /// to 6 members. Do not specify the same component type more than once,
     /// since this will lead to a panic or deadlock when attempting to evaluate
     /// the query.
+    ///
+    /// # Deadlock
+    /// Calling `for_each` on a query implicitly locks all relevant component
+    /// structures, so care must be taken to avoid deadlock.
+    ///
+    /// Creating a query with multiple Filters that operate on the same component type 
+    /// will lead to deadlock.
+    ///
+    /// Creating a query that operates over a component which you already hold a lock on 
+    /// will lead to deadlock.
     ///
     /// # Examples
     /// ```
@@ -331,6 +342,14 @@ impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     pub fn query<F>(&self) -> Query<'a, S, F::Pipeline>
     where F: PipelineFactory {
         Query::new(&self.data, &self.entities, F::create())
+    }
+    
+    // private clone function.
+    fn clone(&self) -> Self {
+        WorldHandle {
+            data: self.data,
+            entities: self.entities
+        }
     }
 }
 

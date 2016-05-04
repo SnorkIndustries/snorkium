@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::sync::RwLock;
 
 use super::*;
 use super::set::{LockGroup, LockedSubset};
@@ -43,7 +44,7 @@ impl<T: Component> Filter for Has<T> {
 /// and `Push`.
 pub trait Pipeline<'a>: Sized {
     type Item: 'a;
-    type LockGroup: for<'b> LockGroup<'b>;
+    type LockGroup: LockGroup<'a>;
     
     /// Consume self along with handles to ECS state to pass all entities
     /// fulfilling the pipeline's predicates to the functions along with
@@ -81,14 +82,14 @@ pub trait PipelineFactory {
 /// these actions and alter the global state.
 pub struct Query<'a, S: Set + 'a, P: 'a> {
     set: &'a S,
-    entities: &'a EntityManager,
+    entities: &'a RwLock<EntityManager>,
     pipeline: P,
 }
 
 impl<'a, S: 'a + Set, P> Query<'a, S, P> where P: 'a + for<'b> Pipeline<'b> {
     /// Create a new query. Use of `WorldHandle::query()` is advised
     /// over this.
-    pub fn new(s: &'a S, entities: &'a EntityManager, pipeline: P) -> Self {
+    pub fn new(s: &'a S, entities: &'a RwLock<EntityManager>, pipeline: P) -> Self {
         Query {
             set: s,
             entities: entities,
@@ -135,10 +136,16 @@ impl<'a, S: 'a + Set, P> Query<'a, S, P> where P: 'a + for<'b> Pipeline<'b> {
     /// This returns a set of locks for component storage acquired for the
     /// necessary components as well as the vector of actions produced.
     /// by the supplied closure.
+    ///
+    /// # Deadlock
+    /// This implicitly acquires locks on the relevant component stores
+    /// as well as the entity manager. If you already hold locks on some
+    /// components already, this can create deadlock.
     pub fn for_each<F, U: Send>(self, f: F) -> QueryResult<U, <<P as Pipeline<'a>>::LockGroup as LockGroup<'a>>::Subset>
     where F: Sync + for<'r> Fn(VerifiedEntity, <P as Pipeline<'r>>::Item) -> U {
         let subset = self.set.lock_subset::<P::LockGroup>();
-        let actions = self.pipeline.for_each(&subset, self.entities, f);
+        let entities = self.entities.read().unwrap();
+        let actions = self.pipeline.for_each(&subset, &entities, f);
         QueryResult {
             actions: actions,
             locks: subset,
