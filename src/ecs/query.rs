@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::sync::RwLock;
 
 use super::*;
-use super::set::{LockGroup, LockedSubset};
+use super::set::LockGroup;
 
 /// Filters are used to test properties of entities' data.
 ///
@@ -22,7 +22,7 @@ pub trait Filter {
 
 /// A filter which tests whether an entity has a specific component.
 /// 
-/// These are automatically created from the implementation of `PipelineFactory`
+/// These are automatically created from the implementation of `FilterFactory`
 /// for tuples of components. See `WorldHandle::query()` for more details.
 pub struct Has<T: Component> {
     _marker: PhantomData<T>,
@@ -36,135 +36,90 @@ impl<T: Component> Filter for Has<T> {
     }
 }
 
-/// A collection of filters.
-///
-/// This technically can be user-implemented, but this whole section
-/// of the API is so intertwined and complex that it's probably best not to.
-/// Re-implementation of Pipeline will require implementations of `PipelineFactory`
-/// and `Push`.
-pub trait Pipeline<'a>: Sized {
-    type Item: 'a;
-    type LockGroup: LockGroup<'a>;
-    
-    /// Consume self along with handles to ECS state to pass all entities
-    /// fulfilling the pipeline's predicates to the functions along with
-    /// relevant component data. This will output a vector of the returned
-    /// outputs from the function.
-    fn for_each<F, U: Send, S: LockedSubset>(self, &'a S, &'a EntityManager, F) -> Vec<U>
-    where F: Sync + Fn(VerifiedEntity, Self::Item) -> U;
-}
-
 /// Convenience trait for extending tuples of filters.
-pub trait Push<T> {
+pub trait PushFilter<T> {
     type Output;
     
     fn push(self, T) -> Self::Output;
 }
 
-/// For creating pipelines.
+/// For creating filter lists.
 ///
+/// This isn't used directly, but instead in the implementation
+/// of `Query`.
 /// This is how we transform tuples of component
 /// types into tuples of "Has" filters. This can be implemented
-/// by the user, but it won't integrate with the Query.
-pub trait PipelineFactory {
-    type Pipeline: for<'a> Pipeline<'a>;
+/// by the user, but it won't integrate with queries.
+///
+/// In practice this is a tuple of components, like
+/// `(A, B, C)` or `(A, B, C, D, E)`. This will map
+/// to a tuple of "Has" filters, one for each component type given.
+///
+/// This tuple can then have other filters "pushed" on top of it to
+/// make a larger tuple.
+pub trait FilterFactory {
+    type Filters: for<'a> FilterGroup<'a>;
     
-    fn create() -> Self::Pipeline;
+    fn create() -> Self::Filters;
 }
 
-/// A query is a collection of filters coupled with handles
-/// to the state of the ECS. 
+/// A group of filters.
 ///
-/// Queries cannot be used to mutate overarching state.
+/// This is implemented for all tuples of filters.
+pub trait FilterGroup<'a> {
+    type Locks: 'a;
+    
+    /// Acquire the necessary locks, find all entities which fulfill these filters,
+    /// and return both.
+    fn filter_acquire<S: 'a + Set>(self, &'a S, &EntityManager) -> (Vec<Entity>, Self::Locks);
+}
+
+/// This stores some handles to the world data as well as a group of filters.
 ///
-/// They are used to select over a specific group of entities, and determine
-/// an action to be performed for each. Then, a user will iterate over each of
-/// these actions and alter the global state.
-pub struct Query<'a, S: Set + 'a, P: 'a> {
-    set: &'a S,
+/// You can consume a query to return a vector of entities matching the filters
+/// as well as the locks for each queried component's data.
+pub struct Query<'a, S: 'a + Set, F> {
     entities: &'a RwLock<EntityManager>,
-    pipeline: P,
+    data: &'a S,
+    filters: F,
 }
 
-impl<'a, S: 'a + Set, P> Query<'a, S, P> where P: 'a + for<'b> Pipeline<'b> {
-    /// Create a new query. Use of `WorldHandle::query()` is advised
-    /// over this.
-    pub fn new(s: &'a S, entities: &'a RwLock<EntityManager>, pipeline: P) -> Self {
+impl<'a, S: 'a + Set, F> Query<'a, S, F> {
+    /// Create a new query.
+    ///
+    /// Use of `WorldHandle::make_query()` is advised over this, although they are
+    /// functionally equivalent.
+    pub fn new(wh: &WorldHandle<'a, S>, filters: F) -> Query<'a, S, F> {
         Query {
-            set: s,
-            entities: entities,
-            pipeline: pipeline,
-        }
+            entities: wh.entities,
+            data: wh.data,
+            filters: filters,
+        }    
     }
     
-    /// Add another component to the query. When "for_each" is called,
-    /// this will filter out all entities without this component.
-    ///
-    /// Adding a component more than once may lead to deadlock or panic.
-    #[inline]
-    pub fn with<T: Component>(self) -> Query<'a, S, <P as Push<Has<T>>>::Output>
-    where P: Push<Has<T>>, <P as Push<Has<T>>>::Output: Pipeline<'a> {
+    /// Add a component to this query. When executed, this query will only return entities which
+    /// have this component.
+    pub fn with<T: Component>(self) -> Query<'a, S, <F as PushFilter<Has<T>>>::Output>
+    where F: PushFilter<Has<T>> {
         self.with_filtered(Has { _marker: PhantomData })
     }
     
-    /// Add a component to the query to be specially filtered. This is useful for those
-    /// cases where components are stored in a special data structure.
-    ///
-    /// Adding a component more than once may lead to deadlock or panic,
-    #[inline]
-    pub fn with_filtered<T: Filter>(self, filter: T) -> Query<'a, S, <P as Push<T>>::Output>
-    where P: Push<T>, <P as Push<T>>::Output: Pipeline<'a> {
+    /// Add a custom filter to this query. When executed, this query will only return entities which
+    /// pass the filter.
+    pub fn with_filtered<T: Filter>(self, f: T) -> Query<'a, S, <F as PushFilter<T>>::Output>
+    where F: PushFilter<T> {
         Query {
-            set: self.set,
             entities: self.entities,
-            pipeline: self.pipeline.push(filter)
+            data: self.data,
+            filters: self.filters.push(f),
         }
     }
     
-    /// Perform an action for each entity which fits the properties of 
-    /// the filter.
-    ///
-    /// This function can be thought of as the "read" phase -- 
-    /// following the Rust idiom of iterating through a collection,
-    /// and creating a list of actions to perform during the "write"
-    /// phase, where state is actually mutated.
-    ///
-    /// Since this function doesn't have the capability of mutating global
-    /// state, it can potentially be distributed across cores for data 
-    /// parallelism.
-    ///
-    /// This returns a set of locks for component storage acquired for the
-    /// necessary components as well as the vector of actions produced.
-    /// by the supplied closure.
-    ///
-    /// # Deadlock
-    /// This implicitly acquires locks on the relevant component stores
-    /// as well as the entity manager. If you already hold locks on some
-    /// components already, this can create deadlock.
-    pub fn for_each<F, U: Send>(self, f: F) -> QueryResult<U, <<P as Pipeline<'a>>::LockGroup as LockGroup<'a>>::Subset>
-    where F: Sync + for<'r> Fn(VerifiedEntity, <P as Pipeline<'r>>::Item) -> U {
-        let subset = self.set.lock_subset::<P::LockGroup>();
+    /// Execute this query. This will return 
+    pub fn execute(self) -> (Vec<Entity>, F::Locks) where F: FilterGroup<'a> {
         let entities = self.entities.read().unwrap();
-        let actions = self.pipeline.for_each(&subset, &entities, f);
-        QueryResult {
-            actions: actions,
-            locks: subset,
-        }
+        self.filters.filter_acquire(self.data, &entities)
     }
-}
-
-/// The result of a query: the actions produced along with a set of handles
-/// to the relevant components' data storage.
-///
-/// Since performing queries necessarily involves locking the mutexes of 
-/// the components being iterated over, it doesn't make sense just to throw
-/// those locks away. The user needs to transform the list of actions 
-/// produced by the query into state changes on the world. For this reason
-/// it would be wasteful to unlock the storage mutexes as the user would
-/// need to lock them again immediately.
-pub struct QueryResult<Action, Subset: LockedSubset> {
-    pub actions: Vec<Action>,
-    pub locks: Subset,
 }
 
 // implementations for tuples.
@@ -180,7 +135,7 @@ macro_rules! access {
 
 macro_rules! push_impl {
     ($($id: ident $num: tt)*) => {
-        impl<$($id: Filter,)* Last: Filter> Push<Last> for ($($id,)*) {
+        impl<$($id: Filter,)* Last: Filter> PushFilter<Last> for ($($id,)*) {
             type Output = ($($id,)* Last,);
             
             fn push(self, last: Last) -> Self::Output {
@@ -200,10 +155,10 @@ push_impl!();
 
 macro_rules! factory {
     ($($id: ident)*) => {
-        impl<$($id: Component,)*> PipelineFactory for ($($id,)*) {
-            type Pipeline = ($(Has<$id>,)*);
+        impl<$($id: Component,)*> FilterFactory for ($($id,)*) {
+            type Filters = ($(Has<$id>,)*);
             
-            fn create() -> Self::Pipeline {
+            fn create() -> Self::Filters {
                 ($(Has::<$id> { _marker: PhantomData }, )*)
             }
         }
@@ -218,7 +173,7 @@ factory!(A B);
 factory!(A);
 factory!();
 
-// filter extension trait used in pipeline implementation.
+// filter extension trait used in filter group implementation.
 trait FilterExt: Filter {
     // return a vector of all living entities which fulfill the predicate
     // in the form Some(e);
@@ -251,61 +206,42 @@ impl<F: Filter> FilterExt for F {
     }
 }
 
-macro_rules! pipeline_impl {
-    () => {
-        impl<'a> Pipeline<'a> for () {
-            type Item = ();
-            type LockGroup = ();
+impl<'a> FilterGroup<'a> for () {
+    type Locks = ();
+    
+    fn filter_acquire<S: 'a + Set>(self, _: &'a S, _: &EntityManager) -> (Vec<Entity>, ()) {
+        (Vec::new(), ())
+    }
+}
+
+macro_rules! group_impl {
+    ($f_id: ident $f_num: tt $($id: ident $num: tt)*) => {
+        
+        impl<'a, $f_id: Filter, $($id: Filter,)*> FilterGroup<'a> for ($f_id, $($id,)*) {
+            type Locks = <($f_id::Component, $($id::Component,)*) as LockGroup<'a>>::Locks;
             
-            fn for_each<F, U: Send, S: LockedSubset>(self, _: &'a S, _: &'a EntityManager, _: F) -> Vec<U>
-            where F: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {
-                Vec::new()
+            #[allow(unused_mut)]
+            fn filter_acquire<S: 'a + Set>(self, set: &'a S, entities: &EntityManager)
+            -> (Vec<Entity>, Self::Locks) {
+                let locks = set.acquire_locks::<($f_id::Component, $($id::Component,)*)>();
+                
+                let mut es = access!(self; $f_num).all(&access!(locks; $f_num), entities);
+                
+                $(
+                    access!(self; $num).filter(&access!(locks; $num), &mut es);  
+                )*
+                
+                let es = es.into_iter().filter_map(|x| x.map(|v| v.entity())).collect();
+                
+                (es, locks)
             }
         }
     };
-    
-    ($f_id: ident $f_num: tt $($id: ident $num: tt)*) => {
-        impl<'a, $f_id: Filter, $($id: Filter,)*> Pipeline<'a> for
-        ($f_id, $($id,)*) {
-            type Item = (&'a $f_id::Component, $(&'a $id::Component,)*);
-            type LockGroup = ($f_id::Component, $($id::Component,)*);
-            
-            #[allow(unused_mut)]
-            fn for_each<OP, U: Send, SET: LockedSubset>(self, set: &'a SET, entities: &'a EntityManager, f: OP) -> Vec<U>
-            where OP: 'a + Sync + Fn(VerifiedEntity, Self::Item) -> U {  
-                // it's ok to unwrap the calls to get_storage() since this function is called with a subset
-                // that has been locked with this pipeline in mind.
-                              
-                // the first filter is special-cased -- we use the "all" method of FilterExt here
-                // to get a vector which will get whittled down.
-                let mut entities = access!(self; $f_num).all(set.get_storage::<$f_id::Component>().unwrap(), entities);
-                
-                // apply the "filter" method of FilterExt to the vector in turn.
-                $(
-                    access!(self; $num).filter(set.get_storage::<$id::Component>().unwrap(), &mut entities);
-                )*
-                
-                // for each entry that is still Some (that is, the entity within passes all filters)
-                entities.into_iter().filter_map(|e| e).map(|e| {
-                    // get the data by looking into the storage containers,
-                    let data = (
-                        set.get_storage::<$f_id::Component>().unwrap().get(e).unwrap(),
-                        $(set.get_storage::<$id::Component>().unwrap().get(e).unwrap(),)*
-                    );
-                    
-                    // and call the function provided, collecting the outputs
-                    // for a "write" phase.
-                    f(e, data)
-                }).collect()
-            }
-        } 
-    };
 }
 
-pipeline_impl!(A 0 B 1 C 2 D 3 E 4 F 5);
-pipeline_impl!(A 0 B 1 C 2 D 3 E 4);
-pipeline_impl!(A 0 B 1 C 2 D 3);
-pipeline_impl!(A 0 B 1 C 2);
-pipeline_impl!(A 0 B 1);
-pipeline_impl!(A 0);
-pipeline_impl!();
+group_impl!(A 0 B 1 C 2 D 3 E 4 F 5);
+group_impl!(A 0 B 1 C 2 D 3 E 4);
+group_impl!(A 0 B 1 C 2 D 3);
+group_impl!(A 0 B 1 C 2);
+group_impl!(A 0 B 1);
+group_impl!(A 0);

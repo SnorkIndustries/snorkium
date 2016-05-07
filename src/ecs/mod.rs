@@ -13,7 +13,7 @@ const MIN_UNUSED: usize = 1024;
 pub mod query;
 pub mod set;
 
-pub use self::set::Set;
+pub use self::set::{Set};
 
 /// A component is a piece of raw data which is associated with an entity.
 ///
@@ -165,8 +165,7 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
     }
     
     fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a> {
-        let iter = self.data.iter().map(|&(e, _)| e);
-        
+        let iter = self.data.iter().map(|&(e, _)| e);        
         Box::new(iter)
     }
 }
@@ -289,6 +288,8 @@ pub struct World<S: Set> {
     entities: RwLock<EntityManager>,
 }
 
+/// This is a temporary handle to the world state.
+/// These are passed to systems when running.
 pub struct WorldHandle<'a, S: 'a + Set> {
     data: &'a S,
     entities: &'a RwLock<EntityManager>,
@@ -297,59 +298,16 @@ pub struct WorldHandle<'a, S: 'a + Set> {
 impl<'a, S: 'a + Set> WorldHandle<'a, S> {
     /// Create a query against the world data.
     ///
-    /// This function takes a type parameter bounded by `PipelineFactory`.
-    /// In practice, this will be a tuple of component types, e.g.
-    /// `(A, B, C)` or `(A, B, C, D, E, F)`. These tuples cannot be arbitrarily
-    /// large due to limitations in the Rust compiler, but they currently go up
-    /// to 6 members. Do not specify the same component type more than once,
-    /// since this will lead to a panic or deadlock when attempting to evaluate
-    /// the query.
+    /// This can be used to find all entities fulfilling
+    /// a set of filters. In practice, these filters will usually just ensure
+    /// that an entity has a specific component. You can push additional filters
+    /// onto a query with the `with` and `with_filtered` functions.
     ///
-    /// # Deadlock
-    /// Calling `for_each` on a query implicitly locks all relevant component
-    /// structures, so care must be taken to avoid deadlock.
-    ///
-    /// Creating a query with multiple Filters that operate on the same component type 
-    /// will lead to deadlock.
-    ///
-    /// Creating a query that operates over a component which you already hold a lock on 
-    /// will lead to deadlock.
-    ///
-    /// # Examples
-    /// ```
-    /// # use snorkium::ecs::*;
-    /// #[derive(Clone, Copy)]
-    /// struct Position(f32, f32);
-    /// #[derive(Clone, Copy)]
-    /// struct Dot;
-    ///     
-    /// // imagine this draws a dot at the position.
-    /// fn draw_dot(_: &Position) { }
-    /// 
-    /// struct DotSystem;
-    /// impl System for DotSystem {
-    ///     // draw a dot for each entity with a position and the zero-sized dot component.
-    ///     fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>) {
-    ///         // when https://github.com/rust-lang/rust/issues/33364 is fixed,
-    ///         // you'll be able to match on the tuple inside the closure arguments list.
-    ///         wh.query::<(Position, Dot)>().for_each(|e, item| {
-    ///             let (p, _) = item;
-    ///             draw_dot(p); 
-    ///         });
-    ///     }
-    /// }
-    /// ```
-    pub fn query<F>(&self) -> Query<'a, S, F::Pipeline>
-    where F: PipelineFactory {
-        Query::new(&self.data, &self.entities, F::create())
-    }
-    
-    // private clone function.
-    fn clone(&self) -> Self {
-        WorldHandle {
-            data: self.data,
-            entities: self.entities
-        }
+    /// To make creating simple queries more easy, this function takes a type 
+    /// parameter which is used to create a tuple of simple `Has` filters.
+    /// See the documentation of `FilterFactory` for more info.
+    pub fn make_query<T: FilterFactory>(&'a self) -> Query<'a, S, T::Filters> {
+        Query::new(self, T::create())
     }
 }
 

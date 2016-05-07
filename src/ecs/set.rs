@@ -8,7 +8,6 @@ use super::*;
 
 trait IsSame {
     fn is_same() -> bool { false }
-  
 }
 
 impl<A, B> IsSame for (A, B) {}
@@ -47,7 +46,7 @@ pub trait Set: Sized + Sync {
     }
     
     /// Lock a subset of this set.
-    fn lock_subset<'a, G: LockGroup<'a>>(&'a self) -> G::Subset {
+    fn acquire_locks<'a, G: LockGroup<'a>>(&'a self) -> G::Locks {
         G::lock(self)
     }
     
@@ -95,84 +94,57 @@ impl<T: Component, P: Set> Set for SetEntry<T, P> {
     }
 }
 
-/// A locked subset of a set.
-///
-/// This is really similar to a `Set`, but the mutexes for each of the
-/// components within have already been obtained. Also, the accessor methods
-/// here return `None` rather than panicking on access, since they are more likely
-/// to be queried with a non-contained component than a `Set` which will encompass
-/// all components.
-pub trait LockedSubset: Sized {
-    fn push<T: Component>(self, guard: MutexGuard<T::Storage>) -> SubsetEntry<T, Self> {
-        SubsetEntry {
-            data: guard,
-            parent: self,
-            _marker: PhantomData,
-        }
-    }
+/// Convenience trait for extending tuples of locks.
+pub trait PushLock<'a, T: Component> {
+    type Output: 'a;
     
-    /// Get a reference to the storage container for the supplied component.
-    /// Fails if this subset hasn't locked that component.
-    fn get_storage<T: Component>(&self) -> Option<&T::Storage>;
-    
-    /// Get a mutable reference to the storage container for the supplied component.
-    /// Fails if this subset hasn't locked that component.
-    fn get_storage_mut<T: Component>(&mut self) -> Option<&mut T::Storage>;
+    fn push(self, MutexGuard<'a, T::Storage>) -> Self::Output;
 }
 
-/// An entry in a subset.
-pub struct SubsetEntry<'a, T: 'a + Component, P: 'a + LockedSubset> {
-    data: MutexGuard<'a, T::Storage>,
-    parent: P,
-    _marker: PhantomData<T>
-}
-
-impl LockedSubset for Empty {
-    fn get_storage<T: Component>(&self) -> Option<&T::Storage> { None }
-    fn get_storage_mut<T: Component>(&mut self) -> Option<&mut T::Storage> { None }
-}
-
-impl<'a, T: 'a + Component, P: 'a + LockedSubset> LockedSubset for SubsetEntry<'a, T, P> {
-    fn get_storage<C: Component>(&self) -> Option<&C::Storage> {
-        if same::<T, C>() {
-            unsafe {
-                Some(mem::transmute::<&T::Storage, &C::Storage>(&*self.data))
+macro_rules! push_impl {
+    () => {
+        impl<'a, T: Component> PushLock<'a, T> for () {
+            type Output = (MutexGuard<'a, T::Storage>,);
+            
+            fn push(self, lock: MutexGuard<'a, T::Storage>) -> Self::Output {
+                (lock,)
             }
-        } else {
-            self.parent.get_storage::<C>()
         }
-    }
+    };
     
-    fn get_storage_mut<C: Component>(&mut self) -> Option<&mut C::Storage> {
-        if same::<T, C>() {
-            unsafe {
-                Some(mem::transmute::<&mut T::Storage, &mut C::Storage>(&mut *self.data))
-            }
-        } else {
-            self.parent.get_storage_mut::<C>()
+    ($f_id:ident $($id: ident)*) => {
+        impl<'a,
+            $f_id: Component, $($id: Component,)*
+            COMP: Component
+        > PushLock<'a, COMP> for (MutexGuard<'a, $f_id::Storage>, $(MutexGuard<'a, $id::Storage>,)*) {
+            type Output = (MutexGuard<'a, $f_id::Storage>, $(MutexGuard<'a, $id::Storage>,)* MutexGuard<'a, COMP::Storage>,);
+            
+            fn push(self, lock: MutexGuard<'a, COMP::Storage>) -> Self::Output {
+                let ($f_id, $($id,)*) = self;
+                ($f_id, $($id,)*, lock)
+            }    
         }
-    }
+        
+        push_impl!($($id)*);  
+    };
 }
 
 /// A group of components to lock.
 pub trait LockGroup<'a> {
-    type Subset: 'a + LockedSubset;
+    type Locks: 'a;
     
-    /// Given a set, lock the subset.
-    fn lock<S: Set>(set: &'a S) -> Self::Subset;
+    /// Given a set, acquire the locks.
+    fn lock<S: Set>(set: &'a S) -> Self::Locks;
 }
 
 macro_rules! group_impl {
     ($f_id: ident $($id: ident)*) => {
         impl<'a, $f_id: Component, $($id: Component,)*>
         LockGroup<'a> for ($f_id, $($id,)*) {
-            type Subset = SubsetEntry<'a,
-                $f_id,
-                <($($id,)*) as LockGroup<'a>>::Subset>;
+            type Locks = (MutexGuard<'a, $f_id::Storage>, $(MutexGuard<'a, $id::Storage>,)*);
                 
-            fn lock<SET: Set>(set: &'a SET) -> Self::Subset {
-                let parent = <($($id,)*) as LockGroup<'a>>::lock(set);
-                LockedSubset::push(parent, set.lock_storage::<$f_id>())
+            fn lock<SET: Set>(set: &'a SET) -> Self::Locks {
+                (set.lock_storage::<$f_id>(), $(set.lock_storage::<$id>(),)*)
             }
         }
         
@@ -181,9 +153,9 @@ macro_rules! group_impl {
     
     () => {
         impl<'a> LockGroup<'a> for () {
-            type Subset = Empty;
+            type Locks = ();
             
-            fn lock<S: Set>(_: &'a S) -> Empty { Empty }
+            fn lock<S: Set>(_: &'a S) -> () { () }
         }
     };
 }
