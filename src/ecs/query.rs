@@ -1,3 +1,5 @@
+//! Queries and filters.
+
 use std::marker::PhantomData;
 use std::sync::RwLock;
 

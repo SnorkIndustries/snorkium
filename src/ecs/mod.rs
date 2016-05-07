@@ -13,16 +13,25 @@ const MIN_UNUSED: usize = 1024;
 pub mod query;
 pub mod set;
 
-pub use self::set::{Set};
+pub use self::set::Set;
+
+#[cfg(not(feature = "nightly"))]
+pub trait ComponentBounds: ::std::any::Any + Copy + Send + Sync {}
+
+#[cfg(feature = "nightly")]
+pub trait ComponentBounds: 'static + Copy + Send + Sync {}
 
 /// A component is a piece of raw data which is associated with an entity.
 ///
 /// "Systems" will typically iterate over all entities with a specific set of components,
 /// performing some action for each.
-pub trait Component: 'static + Copy + Send + Sync {
+///
+/// On nightly, this is automatically implemented for all possible types
+/// with a specializable implementation.
+pub trait Component: ComponentBounds {
     /// The data structure which stores component of this type.
     ///
-    /// By default, this will be the `DefaultStorage` structure,
+    /// By default, this will usually be the `DefaultStorage` structure,
     /// which is good for almost all use-cases.
     /// However, for some components, it is more performant to store them
     /// in a special data structure with custom filters. A good example of this
@@ -31,7 +40,8 @@ pub trait Component: 'static + Copy + Send + Sync {
     type Storage: Storage<Self>;
 }
 
-impl<T: 'static + Copy + Send + Sync> Component for T {
+#[cfg(feature = "nightly")]
+impl<T: ComponentBounds> Component for T {
     default type Storage = DefaultStorage<Self>;
 }
 
@@ -296,6 +306,11 @@ pub struct WorldHandle<'a, S: 'a + Set> {
 }
 
 impl<'a, S: 'a + Set> WorldHandle<'a, S> {
+    /// Get access to the entity manager.
+    pub fn entities(&self) -> &RwLock<EntityManager> {
+        self.entities
+    }
+    
     /// Create a query against the world data.
     ///
     /// This can be used to find all entities fulfilling

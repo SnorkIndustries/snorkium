@@ -1,24 +1,35 @@
 //! Sets of component data.
 
+use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::{Mutex, MutexGuard};
 
 use super::*;
 
+#[cfg(feature = "nightly")]
 trait IsSame {
     fn is_same() -> bool { false }
 }
 
+#[cfg(feature = "nightly")]
 impl<A, B> IsSame for (A, B) {}
+
+#[cfg(feature = "nightly")]
 impl<A> IsSame for (A, A) {
     #[inline]
     fn is_same() -> bool { true }
 }
 
 #[inline]
+#[cfg(feature = "nightly")]
 fn same<A, B>() -> bool {
     <(A, B) as IsSame>::is_same()
+}
+
+#[cfg(not(feature = "nightly"))]
+fn same<A: Any, B: Any>() -> bool {
+    TypeId::of::<A>() == TypeId::of::<B>()
 }
 
 /// The base case of a recursive struct.
