@@ -2,8 +2,15 @@
 name = "snorkium"
 version = "0.1.0"
 authors = ["Robert Habermeier <rphmeier@gmail.com>"]
+build = "build.rs"
 
 [dependencies]
 glutin = "0.5"
 gl = "0.6"
 rayon = "0.3"
+
+[build-dependencies]
+rustc_version = "0.1"
+
+[features]
+nightly = []

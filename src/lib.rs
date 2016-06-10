@@ -1,4 +1,4 @@
-#![feature(specialization)]
+#![cfg_attr(feature = "nightly", feature(specialization))]
 
 extern crate glutin;
 extern crate gl;

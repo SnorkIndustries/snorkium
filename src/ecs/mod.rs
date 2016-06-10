@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::RwLock;
 
-use self::set::*;
 use self::query::*;
 
 const ID_BITS: usize = 24;
@@ -13,14 +13,25 @@ const MIN_UNUSED: usize = 1024;
 pub mod query;
 pub mod set;
 
+pub use self::set::Set;
+
+#[cfg(not(feature = "nightly"))]
+pub trait ComponentBounds: ::std::any::Any + Copy + Send + Sync {}
+
+#[cfg(feature = "nightly")]
+pub trait ComponentBounds: 'static + Copy + Send + Sync {}
+
 /// A component is a piece of raw data which is associated with an entity.
 ///
 /// "Systems" will typically iterate over all entities with a specific set of components,
 /// performing some action for each.
-pub trait Component: 'static + Copy + Send + Sync {
+///
+/// On nightly, this is automatically implemented for all possible types
+/// with a specializable implementation.
+pub trait Component: ComponentBounds {
     /// The data structure which stores component of this type.
     ///
-    /// By default, this will be the `DefaultStorage` structure,
+    /// By default, this will usually be the `DefaultStorage` structure,
     /// which is good for almost all use-cases.
     /// However, for some components, it is more performant to store them
     /// in a special data structure with custom filters. A good example of this
@@ -29,7 +40,8 @@ pub trait Component: 'static + Copy + Send + Sync {
     type Storage: Storage<Self>;
 }
 
-impl<T: 'static + Copy + Send + Sync> Component for T {
+#[cfg(feature = "nightly")]
+impl<T: ComponentBounds> Component for T {
     default type Storage = DefaultStorage<Self>;
 }
 
@@ -163,8 +175,7 @@ impl<T: Component> Storage<T> for DefaultStorage<T> {
     }
     
     fn entities<'a>(&'a self) -> Box<Iterator<Item=Entity> + 'a> {
-        let iter = self.data.iter().map(|&(e, _)| e);
-        
+        let iter = self.data.iter().map(|&(e, _)| e);        
         Box::new(iter)
     }
 }
@@ -284,41 +295,34 @@ impl<'a> Deref for VerifiedEntity<'a> {
 /// The world stores component and entity data.
 pub struct World<S: Set> {
     data: S,
-    entities: EntityManager,
+    entities: RwLock<EntityManager>,
 }
 
+/// This is a temporary handle to the world state.
+/// These are passed to systems when running.
 pub struct WorldHandle<'a, S: 'a + Set> {
     data: &'a S,
-    entities: &'a EntityManager,
+    entities: &'a RwLock<EntityManager>,
 }
 
 impl<'a, S: 'a + Set> WorldHandle<'a, S> {
+    /// Get access to the entity manager.
+    pub fn entities(&self) -> &RwLock<EntityManager> {
+        self.entities
+    }
+    
     /// Create a query against the world data.
     ///
-    /// # Examples
-    /// ```
-    /// use snorkium::ecs::*;
-    /// #[derive(Clone, Copy)]
-    /// struct Position(f32, f32);
-    /// #[derive(Clone, Copy)]
-    /// struct Dot;
-    ///     
-    /// // imagine this draws a dot at the position.
-    /// fn draw_dot(_: &Position) { }
-    /// 
-    /// struct DotSystem;
-    /// impl System for DotSystem {
-    ///     // draw a dot for each entity with a position and the zero-sized dot component.
-    ///     fn process<'a, S: 'a + Set>(&mut self, wh: WorldHandle<'a, S>) {
-    ///         wh.query::<(Position, Dot)>().for_each(|e, (p, d)| {
-    ///             draw_dot(p); 
-    ///         });
-    ///     }
-    /// }
-    /// ```
-    pub fn query<F>(&self) -> Query<'a, S, F::Pipeline>
-    where F: PipelineFactory {
-        Query::new(&self.data, &self.entities, F::create())
+    /// This can be used to find all entities fulfilling
+    /// a set of filters. In practice, these filters will usually just ensure
+    /// that an entity has a specific component. You can push additional filters
+    /// onto a query with the `with` and `with_filtered` functions.
+    ///
+    /// To make creating simple queries more easy, this function takes a type 
+    /// parameter which is used to create a tuple of simple `Has` filters.
+    /// See the documentation of `FilterFactory` for more info.
+    pub fn make_query<T: FilterFactory>(&'a self) -> Query<'a, S, T::Filters> {
+        Query::new(self, T::create())
     }
 }
 
